@@ -7,10 +7,11 @@ import Groq from 'groq-sdk';
 import { Cerebras } from '@cerebras/cerebras_cloud_sdk';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { loadAllSkills } from './utils/skillLoader.js';
+import { listSkills, readSkill } from './utils/skillLoader.js';
 import { generatePosterImage } from './services/mediaService.js';
 import { searchWeb } from './services/searchService.js';
 import { scrapeWebsite } from './services/scrapeService.js';
+import { toolsDefinition } from './tools.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -24,54 +25,130 @@ app.use(express.static(path.join(__dirname, 'public')));
 const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
 const cerebras = process.env.CEREBRAS_API_KEY ? new Cerebras({ apiKey: process.env.CEREBRAS_API_KEY }) : null;
 
-const BASE_SYSTEM_PROMPT = `You are Brahmand (ब्रह्मांड), an elite AI Specialist Agent.
-Be highly intelligent, helpful, and natural in Hinglish or English. Follow loaded skill runbooks strictly.`;
+const BASE_SYSTEM_PROMPT = `You are Brahmand (ब्रह्मांड), an elite, highly autonomous AI Specialist Agent.
+You are smart, perceptive, and a master of "jugaad" (creative problem solving).
+You understand exactly what the user needs. If they want a short response, give a short one. If they want a detailed one, give a detailed one.
+You communicate naturally in Hinglish or English based on the user's tone.
+You MUST ALWAYS use the 'list_skills' tool first when a user asks about what skills you have or what you can do.
+You MUST ALWAYS use the 'read_skill' tool when you need to read a specific skill markdown file. Do not invent skills.
+You have access to several powerful tools: web search, website scraping, reading skill (.md) files, and image generation.
+Use your tools creatively and autonomously to fulfill the user's request. Think outside the box and combine your capabilities effectively.`;
 
 const chatSessions = {};
 
-// Multi-Model Completion Fallback Logic
-async function getAIResponse(messages) {
-  if (cerebras) {
+
+// Execute a specific tool based on function call
+async function executeToolCall(toolCall) {
+  const functionName = toolCall.function.name;
+  let args = {};
+  if (toolCall.function.arguments) {
+      args = JSON.parse(toolCall.function.arguments);
+  }
+  console.log(`🔨 Executing tool: ${functionName} with args: ${JSON.stringify(args)}`);
+
+  try {
+    switch (functionName) {
+      case 'list_skills':
+        return listSkills();
+      case 'read_skill':
+        return readSkill(args.skillName);
+      case 'search_web':
+        return await searchWeb(args.query);
+      case 'scrape_website':
+        return await scrapeWebsite(args.url);
+      case 'generate_image':
+        return await generatePosterImage(args.prompt);
+      default:
+        return `Error: Unknown function ${functionName}`;
+    }
+  } catch (error) {
+    console.error(`Error executing ${functionName}:`, error);
+    return `Error executing tool: ${error.message}`;
+  }
+}
+
+async function runAgentLoop(messages) {
+  const maxIterations = 5;
+  let currentIteration = 0;
+  let finalModelUsed = null;
+  let generatedImageUrl = null;
+
+  while (currentIteration < maxIterations) {
+    let response;
     try {
-      const res = await cerebras.chat.completions.create({
-        messages,
-        model: 'llama-3.3-70b',
-        temperature: 0.3,
-      });
-      return { text: res.choices[0].message.content, model: 'Cerebras (Llama 3.3 70B)' };
+      if (cerebras) {
+        try {
+            response = await cerebras.chat.completions.create({
+              messages: messages,
+              model: 'llama-3.3-70b',
+              temperature: 0.3,
+              tools: toolsDefinition,
+              tool_choice: 'auto'
+            });
+            finalModelUsed = 'Cerebras (Llama 3.3 70B)';
+        } catch(e) {
+            console.warn("Cerebras failed, falling back to Groq...", e.message);
+            if(groq) {
+                response = await groq.chat.completions.create({
+                  messages: messages,
+                  model: 'openai/gpt-oss-120b',
+                  temperature: 0.3,
+                  tools: toolsDefinition,
+                  tool_choice: 'auto'
+                });
+                finalModelUsed = 'Groq (openai/gpt-oss-120b)';
+            } else {
+                throw e;
+            }
+        }
+      } else if (groq) {
+        response = await groq.chat.completions.create({
+          messages: messages,
+          model: 'openai/gpt-oss-120b',
+          temperature: 0.3,
+          tools: toolsDefinition,
+          tool_choice: 'auto'
+        });
+        finalModelUsed = 'Groq (openai/gpt-oss-120b)';
+      } else {
+        throw new Error("No active AI provider found!");
+      }
     } catch (e) {
-      console.warn("Cerebras failed, falling back to Groq...", e.message);
+      console.error("Error calling primary LLM:", e.message);
+      throw e;
+    }
+
+    const message = response.choices[0].message;
+    messages.push(message);
+
+    if (message.tool_calls && message.tool_calls.length > 0) {
+      for (const toolCall of message.tool_calls) {
+        const result = await executeToolCall(toolCall);
+
+        if (toolCall.function.name === 'generate_image') {
+          generatedImageUrl = result;
+        }
+
+        messages.push({
+          tool_call_id: toolCall.id,
+          role: "tool",
+          name: toolCall.function.name,
+          content: typeof result === 'string' ? result : JSON.stringify(result)
+        });
+      }
+      currentIteration++;
+    } else {
+      return {
+        text: message.content,
+        model: finalModelUsed,
+        imageUrl: generatedImageUrl
+      };
     }
   }
 
-  if (groq) {
-    const res = await groq.chat.completions.create({
-      messages,
-      model: 'llama-3.3-70b-versatile',
-      temperature: 0.3,
-    });
-    return { text: res.choices[0].message.content, model: 'Groq (Llama 3.3 70B)' };
-  }
-
-  throw new Error("No active AI provider found!");
+  return { text: "I've reached the maximum number of reasoning steps without a final answer.", model: finalModelUsed, imageUrl: generatedImageUrl };
 }
 
-// 🧠 Smart Intent Classifier: Checks if user explicitly wants an Image
-async function checkImageGenerationIntent(userMessage) {
-  try {
-    const checkMessages = [
-      {
-        role: 'system',
-        content: 'You are an intent classifier. Does the user explicitly ask to create, draw, generate, or show a picture/image/photo/poster? Reply with ONLY "YES" or "NO".'
-      },
-      { role: 'user', content: userMessage }
-    ];
-    const res = await getAIResponse(checkMessages);
-    return res.text.trim().toUpperCase().includes('YES');
-  } catch (e) {
-    return false;
-  }
-}
 
 app.post('/api/session/new', (req, res) => {
   const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -84,73 +161,16 @@ app.post('/api/chat', async (req, res) => {
     const { message, sessionId } = req.body;
     if (!message) return res.status(400).json({ error: 'message field is required' });
 
-    const loadedSkills = loadAllSkills();
-    const FULL_SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}\n\n### LOADED SKILLS & RUNBOOKS ###\n${loadedSkills}`;
-
+    const FULL_SYSTEM_PROMPT = BASE_SYSTEM_PROMPT;
     const history = chatSessions[sessionId] || [];
 
-    // 🕸️ 1. Auto-Detect Web URL Scrape Intent
-    const urlMatch = message.match(/(https?:\/\/[^\s]+|[a-zA-Z0-9-]+\.(com|org|dev|in|io|net)[^\s]*)/i);
-    const isScrapeReq = /scrape|read website|extract page|crawl|fetch url/i.test(message) && urlMatch;
-    
-    let extraContext = "";
-
-    if (isScrapeReq && urlMatch) {
-      let targetUrl = urlMatch[0];
-      if (!targetUrl.startsWith('http')) targetUrl = 'https://' + targetUrl;
-      const scrapedData = await scrapeWebsite(targetUrl);
-      if (scrapedData) {
-        extraContext = `\n\n[SCRAPED WEBSITE CONTENT FROM ${targetUrl}]: \n${scrapedData}\n\nAnalyze and present the key information from this website according to the user request.`;
-      }
-    } else {
-      // 🔍 2. Auto-Detect Web Search Intent
-      const isSearchReq = /search|latest|news|today|current|price|who is|what is|weather|score|update/i.test(message);
-      if (isSearchReq) {
-        const searchResults = await searchWeb(message);
-        if (searchResults) {
-          extraContext = `\n\n[LIVE WEB SEARCH RESULTS FOR "${message}"]: \n${searchResults}\n\nUse the above live search information to provide an up-to-date accurate answer.`;
-        }
-      }
-    }
-
     const messages = [
-      { role: 'system', content: FULL_SYSTEM_PROMPT + extraContext },
+      { role: 'system', content: FULL_SYSTEM_PROMPT },
       ...history,
       { role: 'user', content: message }
     ];
 
-    // 3. Get Smart LLM Response
-    const aiResult = await getAIResponse(messages);
-    let imageUrl = null;
-
-    // 🧠 4. Smart Intent Classifier for Image Generation
-    const needsImage = await checkImageGenerationIntent(message);
-
-    if (needsImage) {
-      console.log("🎨 Smart AI confirmed Image Generation request for:", message);
-
-      const promptGenMessages = [
-        { 
-          role: 'system', 
-          content: 'Output ONLY the raw visual descriptive prompt text for FLUX AI. Focus purely on subject, lighting, composition, and 8k detail.' 
-        },
-        { role: 'user', content: `Generate a visual image prompt for: ${message}` }
-      ];
-
-      let rawPrompt = message;
-      try {
-        const promptRes = await getAIResponse(promptGenMessages);
-        rawPrompt = promptRes.text
-          .replace(/^Here is.*?:/gi, '')
-          .replace(/^Sure.*?:/gi, '')
-          .replace(/["']/g, '')
-          .trim();
-      } catch (e) {
-        console.warn("Could not extract prompt.");
-      }
-
-      imageUrl = await generatePosterImage(rawPrompt);
-    }
+    const aiResult = await runAgentLoop(messages);
 
     // Update session
     history.push({ role: 'user', content: message });
@@ -161,7 +181,7 @@ app.post('/api/chat', async (req, res) => {
       success: true,
       sessionId: sessionId || null,
       message: aiResult.text,
-      imageUrl: imageUrl,
+      imageUrl: aiResult.imageUrl,
       model: aiResult.model
     });
 
