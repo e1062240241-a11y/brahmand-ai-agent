@@ -2,7 +2,7 @@
 import os, json, time
 from openai import OpenAI
 
-API_KEY = "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"
+API_KEY = os.environ.get("GROQ_API_KEY", "")
 client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=API_KEY)
 MODEL = "llama-3.1-8b-instant"
 
